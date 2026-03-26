@@ -44,6 +44,11 @@ alloy-signer-gcp = { workspace = true, features = ["eip712"], optional = true }
 # turnkey
 alloy-signer-turnkey = { workspace = true, features = ["eip712"], optional = true }
 
+tempo-alloy.workspace = true
+tempo-primitives.workspace = true
+
+alloy-eips.workspace = true
+alloy-provider.workspace = true
 async-trait.workspace = true
 clap = { version = "4", features = ["derive", "env", "unicode", "wrap_help"] }
 derive_builder = "0.20"
