@@ -22,7 +22,8 @@ use tempo_precompiles::{
     TIP_FEE_MANAGER_ADDRESS,
     account_keychain::{
         AccountKeychain,
-        IAccountKeychain::{SignatureType, authorizeKeyCall},
+        IAccountKeychain::{KeyRestrictions, SignatureType},
+        authorizeKeyCall,
     },
     error::TempoPrecompileError,
     storage::{PrecompileStorageProvider, StorageCtx},
@@ -243,9 +244,13 @@ pub fn initialize_tempo_precompiles(
                 authorizeKeyCall {
                     keyId: account, // key ID = account address for secp256k1
                     signatureType: SignatureType::Secp256k1,
-                    expiry: u64::MAX,     // never expires
-                    enforceLimits: false, // no spending limits
-                    limits: vec![],
+                    config: KeyRestrictions {
+                        expiry: u64::MAX,     // never expires
+                        enforceLimits: false, // no spending limits
+                        limits: vec![],
+                        allowAnyCalls: true, // unrestricted
+                        allowedCalls: vec![],
+                    },
                 },
             )?;
         }
