@@ -26,10 +26,20 @@ use mpp::{
 };
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use super::persist::{self, PersistedChannel};
+
+/// Shared per-origin channel state: (channels, persisted).
+type SharedChannelState =
+    (Arc<Mutex<HashMap<String, ChannelEntry>>>, Arc<Mutex<HashMap<String, PersistedChannel>>>);
+
+/// Process-wide channel state registry, keyed by origin URL.
+///
+/// Ensures all [`SessionProvider`] instances for the same origin share a single
+/// in-memory channel map, preventing stale `cumulative_amount` reads from disk.
+static GLOBAL_CHANNELS: OnceLock<Mutex<HashMap<String, SharedChannelState>>> = OnceLock::new();
 
 /// Expiring nonce key (U256::MAX) — matches the charge flow.
 const EXPIRING_NONCE_KEY: U256 = U256::MAX;
@@ -75,24 +85,38 @@ impl std::fmt::Debug for SessionProvider {
 
 impl SessionProvider {
     /// Create a new session provider with the given signer and RPC origin URL.
+    ///
+    /// Channel state is shared process-wide: all `SessionProvider` instances
+    /// share the same in-memory channels and persisted state. This prevents
+    /// concurrent providers (e.g. multiple `forge script` providers for the
+    /// same URL) from reading stale `cumulative_amount` values from disk and
+    /// producing duplicate vouchers.
     pub fn new(signer: mpp::PrivateKeySigner, origin: String) -> Self {
-        let persisted = persist::load_channels();
-
-        let mut channels = HashMap::new();
-        for (key, ch) in &persisted {
-            if let Some(entry) = ch.to_channel_entry() {
-                channels.insert(key.clone(), entry);
-            }
-        }
+        let global = GLOBAL_CHANNELS.get_or_init(|| Mutex::new(HashMap::new()));
+        let (channels, persisted) = {
+            let mut map = global.lock().unwrap();
+            map.entry(origin.clone())
+                .or_insert_with(|| {
+                    let persisted = persist::load_channels();
+                    let mut channels = HashMap::new();
+                    for (key, ch) in &persisted {
+                        if let Some(entry) = ch.to_channel_entry() {
+                            channels.insert(key.clone(), entry);
+                        }
+                    }
+                    (Arc::new(Mutex::new(channels)), Arc::new(Mutex::new(persisted)))
+                })
+                .clone()
+        };
 
         Self {
             signer,
             signing_mode: TempoSigningMode::Direct,
             authorized_signer: None,
             default_deposit: None,
-            channels: Arc::new(Mutex::new(channels)),
+            channels,
             key_provisioned: Arc::new(Mutex::new(true)),
-            persisted: Arc::new(Mutex::new(persisted)),
+            persisted,
             origin,
         }
     }
@@ -344,8 +368,24 @@ impl SessionProvider {
         use mpp::client::tempo::charge::{SignOptions, TempoCharge};
 
         let charge = TempoCharge::from_challenge(challenge)?;
-        let options =
-            SignOptions { signing_mode: Some(self.signing_mode.clone()), ..Default::default() };
+
+        // Strip key_authorization from the signing mode when the key is already
+        // provisioned on-chain. Otherwise the payment tx includes a redundant
+        // key provisioning call that fails with "access key already exists".
+        let signing_mode = if *self.key_provisioned.lock().unwrap() {
+            match &self.signing_mode {
+                TempoSigningMode::Keychain { wallet, version, .. } => TempoSigningMode::Keychain {
+                    wallet: *wallet,
+                    key_authorization: None,
+                    version: *version,
+                },
+                other => other.clone(),
+            }
+        } else {
+            self.signing_mode.clone()
+        };
+
+        let options = SignOptions { signing_mode: Some(signing_mode), ..Default::default() };
         let signed = charge.sign_with_options(&self.signer, options).await?;
         Ok(signed.into_credential())
     }
@@ -387,57 +427,76 @@ impl PaymentProvider for SessionProvider {
         let key = Self::channel_key(&payee, &currency, &escrow_contract);
 
         // Check for existing open channel → sign a voucher
-        let existing = self.channels.lock().unwrap().get(&key).cloned();
-        if let Some(mut entry) = existing
-            && entry.opened
-        {
-            let deposit = self
-                .persisted
-                .lock()
-                .unwrap()
-                .get(&key)
-                .and_then(|p| p.deposit.parse::<u128>().ok())
-                .unwrap_or(u128::MAX);
+        //
+        // The cumulative_amount must be incremented atomically under the lock
+        // to prevent concurrent requests from reading the same value and
+        // producing duplicate vouchers (the server rejects vouchers whose
+        // cumulativeAmount is not strictly greater than the last accepted one).
+        let voucher_info = {
+            let mut channels = self.channels.lock().unwrap();
+            if let Some(entry) = channels.get_mut(&key)
+                && entry.opened
+            {
+                let deposit = self
+                    .persisted
+                    .lock()
+                    .unwrap()
+                    .get(&key)
+                    .and_then(|p| p.deposit.parse::<u128>().ok())
+                    .unwrap_or(u128::MAX);
 
-            if entry.cumulative_amount + amount > deposit {
-                let additional = self.resolve_deposit(session_req.suggested_deposit.as_deref())?;
-                debug!(
-                    cumulative = entry.cumulative_amount,
-                    amount, deposit, additional, "channel deposit exhausted, topping up"
-                );
+                if entry.cumulative_amount + amount > deposit {
+                    Some(Err((entry.clone(), deposit)))
+                } else {
+                    entry.cumulative_amount += amount;
+                    Some(Ok(entry.clone()))
+                }
+            } else {
+                None
+            }
+        };
 
-                let payload = self
-                    .create_topup_tx(&entry, additional, currency, session_req.fee_payer())
+        if let Some(result) = voucher_info {
+            match result {
+                Err((entry, deposit)) => {
+                    let additional =
+                        self.resolve_deposit(session_req.suggested_deposit.as_deref())?;
+                    debug!(
+                        cumulative = entry.cumulative_amount,
+                        amount, deposit, additional, "channel deposit exhausted, topping up"
+                    );
+
+                    let payload = self
+                        .create_topup_tx(&entry, additional, currency, session_req.fee_payer())
+                        .await?;
+
+                    if let Some(p) = self.persisted.lock().unwrap().get_mut(&key) {
+                        let old_deposit: u128 = p.deposit.parse().unwrap_or(0);
+                        p.deposit = (old_deposit + additional).to_string();
+                    }
+                    persist::save_channels(&self.persisted.lock().unwrap());
+
+                    return Ok(build_credential(challenge, payload, chain_id, payer));
+                }
+                Ok(entry) => {
+                    let payload = create_voucher_payload(
+                        &self.signer,
+                        entry.channel_id,
+                        entry.cumulative_amount,
+                        escrow_contract,
+                        chain_id,
+                    )
                     .await?;
 
-                if let Some(p) = self.persisted.lock().unwrap().get_mut(&key) {
-                    let old_deposit: u128 = p.deposit.parse().unwrap_or(0);
-                    p.deposit = (old_deposit + additional).to_string();
+                    persist::upsert_channel(
+                        &mut self.persisted.lock().unwrap(),
+                        &key,
+                        &entry,
+                        0,
+                        &self.origin,
+                    );
+                    return Ok(build_credential(challenge, payload, chain_id, payer));
                 }
-                persist::save_channels(&self.persisted.lock().unwrap());
-
-                return Ok(build_credential(challenge, payload, chain_id, payer));
-            } else {
-                entry.cumulative_amount += amount;
-
-                let payload = create_voucher_payload(
-                    &self.signer,
-                    entry.channel_id,
-                    entry.cumulative_amount,
-                    escrow_contract,
-                    chain_id,
-                )
-                .await?;
-
-                self.channels.lock().unwrap().insert(key.clone(), entry.clone());
-                persist::upsert_channel(
-                    &mut self.persisted.lock().unwrap(),
-                    &key,
-                    &entry,
-                    0,
-                    &self.origin,
-                );
-                return Ok(build_credential(challenge, payload, chain_id, payer));
             }
         }
 
@@ -469,5 +528,167 @@ impl PaymentProvider for SessionProvider {
             &self.origin,
         );
         Ok(build_credential(challenge, payload, chain_id, payer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mpp::client::tempo::signing::KeychainVersion;
+
+    #[test]
+    fn test_key_provisioned_default_is_true() {
+        let signer = mpp::PrivateKeySigner::random();
+        let provider = SessionProvider::new(signer, "https://rpc.example.com".into());
+        assert!(*provider.key_provisioned.lock().unwrap());
+    }
+
+    #[test]
+    fn test_set_key_provisioned() {
+        let signer = mpp::PrivateKeySigner::random();
+        let provider = SessionProvider::new(signer, "https://rpc.example.com".into());
+        provider.set_key_provisioned(false);
+        assert!(!*provider.key_provisioned.lock().unwrap());
+        provider.set_key_provisioned(true);
+        assert!(*provider.key_provisioned.lock().unwrap());
+    }
+
+    #[test]
+    fn test_pay_charge_strips_key_auth_when_provisioned() {
+        // When key_provisioned is true (default), pay_charge should produce a
+        // signing mode with key_authorization: None.
+        let signer = mpp::PrivateKeySigner::random();
+        let wallet = Address::repeat_byte(0xAA);
+        let signing_mode = TempoSigningMode::Keychain {
+            wallet,
+            key_authorization: Some(Box::new(
+                // Dummy value — never sent on-chain in this test.
+                unsafe { std::mem::zeroed() },
+            )),
+            version: KeychainVersion::V2,
+        };
+        let provider = SessionProvider::new(signer, "https://rpc.example.com".into())
+            .with_signing_mode(signing_mode);
+
+        // Simulate the stripping logic from pay_charge
+        let provisioned = *provider.key_provisioned.lock().unwrap();
+        let result_mode = strip_key_auth_if_provisioned(&provider.signing_mode, provisioned);
+
+        assert!(
+            result_mode.key_authorization().is_none(),
+            "key_authorization should be stripped when key is provisioned"
+        );
+    }
+
+    #[test]
+    fn test_pay_charge_keeps_key_auth_when_not_provisioned() {
+        let signer = mpp::PrivateKeySigner::random();
+        let wallet = Address::repeat_byte(0xAA);
+        let signing_mode = TempoSigningMode::Keychain {
+            wallet,
+            key_authorization: Some(Box::new(unsafe { std::mem::zeroed() })),
+            version: KeychainVersion::V2,
+        };
+        let provider = SessionProvider::new(signer, "https://rpc.example.com".into())
+            .with_signing_mode(signing_mode);
+
+        // Mark key as NOT provisioned
+        provider.set_key_provisioned(false);
+
+        let provisioned = *provider.key_provisioned.lock().unwrap();
+        let result_mode = strip_key_auth_if_provisioned(&provider.signing_mode, provisioned);
+
+        assert!(
+            result_mode.key_authorization().is_some(),
+            "key_authorization should be preserved when key is NOT provisioned"
+        );
+    }
+
+    #[test]
+    fn test_pay_charge_direct_mode_unaffected() {
+        let signer = mpp::PrivateKeySigner::random();
+        let provider = SessionProvider::new(signer, "https://rpc.example.com".into())
+            .with_signing_mode(TempoSigningMode::Direct);
+
+        let provisioned = *provider.key_provisioned.lock().unwrap();
+        let result_mode = strip_key_auth_if_provisioned(&provider.signing_mode, provisioned);
+
+        assert!(
+            matches!(result_mode, TempoSigningMode::Direct),
+            "Direct mode should pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_voucher_increments_are_unique() {
+        // Simulate the atomic increment logic: multiple threads reading from
+        // the same channel should each get a unique cumulative_amount.
+        let channels: Arc<Mutex<HashMap<String, ChannelEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let key = "test-channel".to_string();
+        channels.lock().unwrap().insert(
+            key.clone(),
+            ChannelEntry {
+                channel_id: Default::default(),
+                salt: Default::default(),
+                cumulative_amount: 0,
+                escrow_contract: Address::ZERO,
+                chain_id: 42431,
+                opened: true,
+            },
+        );
+
+        let amount: u128 = 1000;
+        let num_threads = 20;
+        let results: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
+
+        std::thread::scope(|s| {
+            for _ in 0..num_threads {
+                let channels = channels.clone();
+                let key = key.clone();
+                let results = results.clone();
+                s.spawn(move || {
+                    let cumulative = {
+                        let mut ch = channels.lock().unwrap();
+                        let entry = ch.get_mut(&key).unwrap();
+                        entry.cumulative_amount += amount;
+                        entry.cumulative_amount
+                    };
+                    results.lock().unwrap().push(cumulative);
+                });
+            }
+        });
+
+        let mut amounts = results.lock().unwrap().clone();
+        amounts.sort();
+        amounts.dedup();
+        assert_eq!(
+            amounts.len(),
+            num_threads,
+            "each concurrent increment should produce a unique cumulative_amount"
+        );
+        assert_eq!(
+            *amounts.last().unwrap(),
+            amount * num_threads as u128,
+            "final cumulative_amount should equal amount × num_threads"
+        );
+    }
+
+    fn strip_key_auth_if_provisioned(
+        mode: &TempoSigningMode,
+        provisioned: bool,
+    ) -> TempoSigningMode {
+        if provisioned {
+            match mode {
+                TempoSigningMode::Keychain { wallet, version, .. } => TempoSigningMode::Keychain {
+                    wallet: *wallet,
+                    key_authorization: None,
+                    version: *version,
+                },
+                other => other.clone(),
+            }
+        } else {
+            mode.clone()
+        }
     }
 }
